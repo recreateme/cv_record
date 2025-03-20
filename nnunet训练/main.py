@@ -89,133 +89,89 @@ def preprocess_folders(root_path):
         process_subfolders(folder_path)
 
 
-def get_RTStructure_label(root_dir):
-    all_labels = set()
-    for patient_idx, patient_dir in enumerate(os.listdir(root_dir)):
-        patient_path = os.path.join(root_dir, patient_dir)
-        meta_file = None
-
-        for sub_dir in os.listdir(patient_path):
-            sub_dir_path = os.path.join(patient_path, sub_dir)
-            if os.path.isfile(sub_dir_path) and sub_dir_path.endswith('.dcm'):
-                continue
-            else:
-                plnas_files = os.listdir(sub_dir_path)
-                for plnas_file in plnas_files:
-                    if plnas_file.lower().startswith('rs') and plnas_file.endswith('.dcm'):
-                        meta_file = os.path.join(sub_dir_path, plnas_file)
-                        break
-                if meta_file is None:
-                    print("缺少RTStructure文件,跳过该用户")
-                    break
-
-        if meta_file:
-            rtss = pydicom.dcmread(meta_file)
-            label_mapping = {}
-
-            for roi in rtss.StructureSetROISequence:
-                roi_number = roi.ROINumber
-                roi_name = roi.ROIName.lower()
-                label_mapping[roi_number] = roi_name
-                all_labels.add(roi_name)
-            print(patient_idx + 1, "=====", sorted(label_mapping.items()))
-    return all_labels
-
-
 class ProcessThread(QThread):
-    progress = pyqtSignal(int)  # 进度信号
-    finished = pyqtSignal(list, int, int)  # 完成信号：标签列表, 删除的重复日期数, 删除的无效用户数
-    error = pyqtSignal(str)  # 错误信号
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(set, int, int, int)
+    error = pyqtSignal(str)
 
-    def __init__(self, folder_path):
+    def __init__(self, root_dir):
         super().__init__()
-        self.folder_path = folder_path
+        self.root_dir = root_dir
 
     def run(self):
         try:
-            deleted_dates = 0  # 统计删除的重复日期文件夹数
-            deleted_patients = 0  # 统计删除的无效用户数
-
-            # 处理多余文件夹并统计删除的文件夹数
-            patient_folders = [f for f in os.listdir(self.folder_path)
-                               if os.path.isdir(os.path.join(self.folder_path, f))]
-
-            # 第一遍遍历：处理日期文件夹
-            for folder in patient_folders:
-                folder_path = os.path.join(self.folder_path, folder)
-                subfolders = [f for f in os.listdir(folder_path)
-                              if os.path.isdir(os.path.join(folder_path, f))]
-                if len(subfolders) <= 1:
-                    continue
-
-                date_pattern = re.compile(r'\d{4}[-_]?\d{2}[-_]?\d{2}')
-                folder_dates = {}
-                for subfolder in subfolders:
-                    match = date_pattern.search(subfolder)
-                    if match:
-                        date_str = match.group().replace('-', '').replace('_', '')
-                        try:
-                            folder_date = datetime.strptime(date_str, '%Y%m%d')
-                            folder_dates[subfolder] = folder_date
-                        except ValueError:
-                            continue
-
-                if folder_dates:
-                    sorted_folders = sorted(folder_dates.items(), key=lambda x: x[1], reverse=True)
-                    latest_folder = sorted_folders[0][0]
-
-                    # 统计删除的文件夹数
-                    for subfolder in subfolders:
-                        if subfolder != latest_folder:
-                            deleted_dates += 1
-                            folder_to_delete = os.path.join(folder_path, subfolder)
-                            try:
-                                import shutil
-                                shutil.rmtree(folder_to_delete)
-                            except Exception as e:
-                                print(f"Error deleting folder {folder_to_delete}: {e}")
-
-            # 第二遍遍历：检查并处理缺少RTStructure的用户
-            patient_folders = [f for f in os.listdir(self.folder_path)
-                               if os.path.isdir(os.path.join(self.folder_path, f))]
             all_labels = set()
+            deleted_dates = 0
+            deleted_patients = 0
 
-            for idx, patient_dir in enumerate(patient_folders):
-                self.progress.emit(idx + 1)
-                patient_path = os.path.join(self.folder_path, patient_dir)
-                has_rtstructure = False
+            patient_dirs = [os.path.join(self.root_dir, d) for d in os.listdir(self.root_dir) if
+                            os.path.isdir(os.path.join(self.root_dir, d))]
+            total_patients = len(patient_dirs)
+            self.progress.emit(0)
 
-                # 查找RTStructure文件
-                for root, _, files in os.walk(patient_path):
-                    for file in files:
+            for patient_idx, patient_dir in enumerate(patient_dirs):
+                rtstruct_found = False
+                latest_folder = None
+                latest_time = None
+
+                # 遍历用户目录下的所有文件和文件夹
+                for entry in os.listdir(patient_dir):
+                    entry_path = os.path.join(patient_dir, entry)
+                    if os.path.isdir(entry_path):
+                        # 检查文件夹的修改时间
+                        entry_time = os.path.getmtime(entry_path)
+                        if latest_time is None or entry_time > latest_time:
+                            latest_time = entry_time
+                            latest_folder = entry_path
+
+                # 删除多余的文件夹
+                for entry in os.listdir(patient_dir):
+                    entry_path = os.path.join(patient_dir, entry)
+                    if os.path.isdir(entry_path) and entry_path != latest_folder:
+                        shutil.rmtree(entry_path)
+                        deleted_dates += 1
+
+                # 检查最新文件夹中是否有RTStructure文件
+                if latest_folder:
+                    for file in os.listdir(latest_folder):
                         if file.lower().startswith('rs') and file.endswith('.dcm'):
-                            try:
-                                rtss = pydicom.dcmread(os.path.join(root, file))
-                                for roi in rtss.StructureSetROISequence:
-                                    roi_name = roi.ROIName.lower()
-                                    all_labels.add(roi_name)
-                                has_rtstructure = True
-                                break
-                            except:
-                                continue
-                    if has_rtstructure:
-                        break
+                            rtstruct_found = True
+                            rtstruct_path = os.path.join(latest_folder, file)
+                            # 读取RTStructure文件
+                            rtss = pydicom.dcmread(rtstruct_path)
+                            for roi in rtss.StructureSetROISequence:
+                                all_labels.add(roi.ROIName.lower())
+                            break
 
-                # 如果没有找到有效的RTStructure文件，删除该用户文件夹
-                if not has_rtstructure:
-                    try:
-                        import shutil
-                        shutil.rmtree(patient_path)
-                        deleted_patients += 1
-                        print(f"删除缺少RTStructure的用户: {patient_dir}")
-                    except Exception as e:
-                        print(f"删除用户文件夹失败 {patient_dir}: {e}")
+                # 如果没有找到RTStructure文件，删除整个用户目录
+                if not rtstruct_found:
+                    shutil.rmtree(patient_dir)
+                    deleted_patients += 1
 
-            # 发送结果，包括统计信息
-            self.finished.emit(sorted(all_labels), deleted_dates, deleted_patients)
+                # 更新进度条
+                self.progress.emit(int((patient_idx + 1) / total_patients * 100))
+
+            # 计算处理后的病人数据数目
+            remaining_patient_dirs = [d for d in os.listdir(self.root_dir) if
+                                      os.path.isdir(os.path.join(self.root_dir, d))]
+            remaining_patients = len(remaining_patient_dirs)
+
+            self.finished.emit(all_labels, deleted_dates, deleted_patients, remaining_patients)
 
         except Exception as e:
             self.error.emit(str(e))
+
+
+def recursive_listdir(path):
+    """Recursively list all files in a directory."""
+    files = []
+    for entry in os.listdir(path):
+        full_path = os.path.join(path, entry)
+        if os.path.isdir(full_path):
+            files.extend(recursive_listdir(full_path))
+        else:
+            files.append(full_path)
+    return files
 
 
 class DropArea(QWidget):
@@ -246,6 +202,7 @@ class DropArea(QWidget):
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
+        self.progress_bar.setFixedHeight(20)  # 固定高度
         self.progress_bar.setStyleSheet("""
             QProgressBar {
                 border: 1px solid #ccc;
@@ -390,9 +347,10 @@ class DropArea(QWidget):
     def merge_labels(self):
         # 获取选中的标签
         selected_labels = [cb.text() for cb in self.checkboxes if cb.isChecked()]
+
+        # 检查是否选择了至少两个标签
         if len(selected_labels) < 2:
-            self.status_label.setText("请至少选择两个标签进行合并！")
-            self.status_label.setStyleSheet("color: #f44336;")
+            QMessageBox.warning(self, "警告", "至少选择两种标签用于合并")
             return
 
         # 获取新标签名
@@ -404,6 +362,7 @@ class DropArea(QWidget):
 
         # 添加处理进度条
         merge_progress = QProgressBar(self)
+        merge_progress.setFixedHeight(20)  # 固定高度
         merge_progress.setStyleSheet("""
             QProgressBar {
                 border: 1px solid #ccc;
@@ -424,7 +383,8 @@ class DropArea(QWidget):
             self.status_label.setStyleSheet("color: #000;")
 
             # 获取总文件夹数
-            patient_folders = [d for d in os.listdir(self.folder_path) if os.path.isdir(os.path.join(self.folder_path, d))]
+            patient_folders = [d for d in os.listdir(self.folder_path) if
+                               os.path.isdir(os.path.join(self.folder_path, d))]
             total_folders = len(patient_folders)
             merge_progress.setMaximum(total_folders)
 
@@ -435,7 +395,8 @@ class DropArea(QWidget):
             for patient_dir in patient_folders:
                 processed_count += 1
                 merge_progress.setValue(processed_count)
-                self.status_label.setText(f"正在处理: {patient_dir} ({processed_count}/{total_folders})")
+                self.status_label.setText(
+                    f"正在处理: {patient_dir[:min(len(patient_dir), 10)]}... ({processed_count}/{total_folders})")
                 QApplication.processEvents()  # 更新界面
 
                 patient_path = os.path.join(self.folder_path, patient_dir)
@@ -443,71 +404,96 @@ class DropArea(QWidget):
                     continue
 
                 # 查找RTStructure文件
-                for root, _, files in os.walk(patient_path):
-                    for file in files:
-                        if file.lower().startswith('rs') and file.endswith('.dcm'):
-                            file_path = os.path.join(root, file)
-                            try:
-                                # 读取DICOM文件
-                                ds = pydicom.dcmread(file_path)
-                                modified = False
+                rtstruct_path = None
+                for sub_dir in os.listdir(patient_path):
+                    if rtstruct_path: break
+                    sub_dir_path = os.path.join(patient_path, sub_dir)
+                    if os.path.isfile(sub_dir_path):
+                        continue
+                    else:
+                        plans_files = os.listdir(sub_dir_path)
+                        for plans_file in plans_files:
+                            if plans_file.lower().startswith('rs') and plans_file.endswith('.dcm'):
+                                rtstruct_path = os.path.join(sub_dir_path, plans_file)
+                                break
 
-                                # 创建ROI名称到编号的映射
-                                roi_name_to_number = {}
-                                for roi in ds.StructureSetROISequence:
-                                    roi_name_to_number[roi.ROIName.lower()] = roi.ROINumber
-
-                                # 找到要合并的ROI的编号
-                                roi_numbers_to_merge = []
-                                for label in selected_labels:
-                                    if label.lower() in roi_name_to_number:
-                                        roi_numbers_to_merge.append(roi_name_to_number[label.lower()])
-
-                                if roi_numbers_to_merge:
-                                    # 更新第一个ROI的名称
-                                    first_roi_number = roi_numbers_to_merge[0]
-                                    for roi in ds.StructureSetROISequence:
-                                        if roi.ROINumber == first_roi_number:
-                                            roi.ROIName = new_label
-                                            modified = True
-
-                                    # 删除其他ROI
-                                    if len(roi_numbers_to_merge) > 1:
-                                        ds.StructureSetROISequence = [
-                                            roi for roi in ds.StructureSetROISequence
-                                            if roi.ROINumber not in roi_numbers_to_merge[1:]
-                                        ]
-                                        modified = True
-
-                                if modified:
-                                    ds.save_as(file_path)
-                                    modified_count += 1
-
-                            except Exception as e:
-                                print(f"处理文件 {file_path} 时出错: {str(e)}")
-
-            # 处理完成后更新标签列表
-            all_labels = set()
-            for patient_dir in os.listdir(self.folder_path):
-                patient_path = os.path.join(self.folder_path, patient_dir)
-                if not os.path.isdir(patient_path):
+                if not rtstruct_path:
                     continue
 
-                for root, _, files in os.walk(patient_path):
-                    for file in files:
-                        if file.lower().startswith('rs') and file.endswith('.dcm'):
-                            try:
-                                ds = pydicom.dcmread(os.path.join(root, file))
-                                for roi in ds.StructureSetROISequence:
-                                    all_labels.add(roi.ROIName.lower())
-                            except:
-                                continue
+                # 读取RTStructure文件
+                try:
+                    ds = pydicom.dcmread(rtstruct_path)
+                    roi_numbers_to_merge = []
+                    for roi in ds.StructureSetROISequence:
+                        if roi.ROIName.lower() in selected_labels:
+                            roi_numbers_to_merge.append(roi.ROINumber)
+
+                    if not roi_numbers_to_merge:
+                        continue  # 跳过不包含选中标签的用户
+
+                    if len(roi_numbers_to_merge) == 1:
+                        # 仅有一个标签，直接修改RTStructure文件
+                        for roi in ds.StructureSetROISequence:
+                            if roi.ROINumber == roi_numbers_to_merge[0]:
+                                roi.ROIName = new_label
+                                modified_count += 1
+                                break
+                    else:
+                        # 多个标签，合并轮廓信息
+                        new_contour_sequence = []
+                        for contour in ds.ROIContourSequence:
+                            if contour.ReferencedROINumber in roi_numbers_to_merge:
+                                new_contour_sequence.extend(contour.ContourSequence)
+
+                        # 更新第一个ROI的名称
+                        first_roi_number = roi_numbers_to_merge[0]
+                        for roi in ds.StructureSetROISequence:
+                            if roi.ROINumber == first_roi_number:
+                                roi.ROIName = new_label
+                                break
+
+                        # 删除其他ROI
+                        ds.StructureSetROISequence = [
+                            roi for roi in ds.StructureSetROISequence
+                            if roi.ROINumber not in roi_numbers_to_merge[1:]
+                        ]
+
+                        # 更新轮廓序列
+                        ds.ROIContourSequence = [
+                            contour for contour in ds.ROIContourSequence
+                            if contour.ReferencedROINumber == first_roi_number
+                        ]
+                        ds.ROIContourSequence[0].ContourSequence = new_contour_sequence
+
+                        modified_count += 1
+
+                    ds.save_as(rtstruct_path)
+
+                except Exception as e:
+                    print(f"处理文件 {rtstruct_path} 时出错: {str(e)}")
 
             # 显示完成消息
             QMessageBox.information(self, "合并完成",
                                     f"标签合并完成！\n"
                                     f"- 处理了 {total_folders} 个病人文件夹\n"
                                     f"- 修改了 {modified_count} 个RTStructure文件")
+
+            # 更新标签复选框
+            all_labels = set()
+            for patient_dir in os.listdir(self.folder_path):
+                patient_path = os.path.join(self.folder_path, patient_dir)
+                if not os.path.isdir(patient_path):
+                    continue
+
+                files = recursive_listdir(patient_path)
+                for file in files:
+                    if file.lower().startswith('rs') and file.endswith('.dcm'):
+                        try:
+                            ds = pydicom.dcmread(file)
+                            for roi in ds.StructureSetROISequence:
+                                all_labels.add(roi.ROIName.lower())
+                        except:
+                            continue
 
             # 更新标签复选框
             self.update_label_checkboxes(sorted(all_labels))
@@ -524,127 +510,13 @@ class DropArea(QWidget):
             # 移除进度条
             merge_progress.deleteLater()
 
-    def convert_dicom_to_nnunet(self, root_dir, output_dir, dataset_id=1, dataset_name="RT_Structures"):
-        """
-        参数说明：
-        root_dir：原始DICOM数据根目录（包含各个患者子目录）
-        output_dir：输出目录（会自动创建nnUNet要求的文件夹结构）
-        dataset_id：数据集ID（三位整数，如1）
-        dataset_name：数据集名称（如Liver_Tumors）
-        """
-        # 创建nnUNet标准目录结构
-        dataset_folder = f"Dataset{dataset_id:03d}_{dataset_name}"
-        output_path = os.path.join(output_dir, dataset_folder)
-        os.makedirs(os.path.join(output_path, "imagesTr"), exist_ok=True)
-        os.makedirs(os.path.join(output_path, "labelsTr"), exist_ok=True)
-
-        # 初始化数据结构
-        all_modalities = {"0": "CT"}  # 模态信息
-        label_mapping = OrderedDict({"0": "background"})
-        training_list = []
-
-        # 遍历患者目录
-        patient_dirs = [os.path.join(root_dir, d) for d in os.listdir(root_dir) if
-                        os.path.isdir(os.path.join(root_dir, d))]
-        for patient_id, patient_dir in enumerate(patient_dirs):
-            # 查找CT序列和RTSTRUCT文件
-            ct_series = []
-            rtstruct_path = None
-
-            for sub_dir in os.listdir(patient_dir):
-                sub_dir_path = os.path.join(patient_dir, sub_dir)
-                if os.path.isfile(sub_dir_path) and sub_dir_path.endswith('.dcm'):
-                    ct_series.append(sub_dir_path)
-                else:
-                    plnas_files = os.listdir(sub_dir_path)
-                    for plans_file in plnas_files:
-                        if plans_file.lower().startswith('rs') and plans_file.endswith('.dcm'):
-                            rtstruct_path = os.path.join(sub_dir_path, plans_file)
-                            break
-
-            # 转换CT图像为NIfTI
-            ct_series.sort(key=lambda x: pydicom.dcmread(x).InstanceNumber)
-            reader = sitk.ImageSeriesReader()
-            reader.SetFileNames(ct_series)
-            ct_volume = reader.Execute()
-
-            # 保存CT图像
-            ct_output_path = os.path.join(output_path, "imagesTr", f"{patient_id}_0000.nii.gz")
-            sitk.WriteImage(ct_volume, ct_output_path)
-
-            # 处理RTSTRUCT文件
-            rtss = pydicom.dcmread(rtstruct_path)
-            roi_names = {}
-            for roi in rtss.StructureSetROISequence:
-                roi_number = roi.ROINumber
-                roi_name = roi.ROIName.strip().lower()
-                roi_names[roi_number] = roi_name
-                if roi_name not in label_mapping.values():
-                    label_mapping[str(len(label_mapping))] = roi_name
-
-            # 创建标签图像
-            reference_image = sitk.ReadImage(ct_series[0])
-            label_array = np.zeros(sitk.GetArrayFromImage(ct_volume).shape, dtype=np.uint8)
-
-            # 解析ROI轮廓数据
-            for contour in rtss.ROIContourSequence:
-                roi_number = contour.ReferencedROINumber
-                if roi_number not in roi_names:
-                    continue
-
-                # 获取当前ROI的标签值
-                label_value = [k for k, v in label_mapping.items() if v == roi_names[roi_number]][0]
-
-                # 处理每个轮廓序列
-                if hasattr(contour, 'ContourSequence'):
-                    for contour_seq in contour.ContourSequence:
-                        # 转换轮廓坐标到体素空间
-                        contour_data = np.array(contour_seq.ContourData).reshape(-1, 3)
-                        contour_indices = [ct_volume.TransformPhysicalPointToIndex(point)
-                                           for point in contour_data]
-
-                        # 使用SimpleITK绘制多边形填充
-                        for idx in contour_indices:
-                            try:
-                                label_array[idx[2], idx[1], idx[0]] = int(label_value)
-                            except IndexError:
-                                continue
-
-            # 保存标签图像
-            label_image = sitk.GetImageFromArray(label_array)
-            label_image.CopyInformation(ct_volume)
-            label_output_path = os.path.join(output_path, "labelsTr", f"{patient_id}.nii.gz")
-            sitk.WriteImage(label_image, label_output_path)
-
-            # 添加到训练列表
-            training_list.append({
-                "image": f"./imagesTr/{patient_id}_0000.nii.gz",
-                "label": f"./labelsTr/{patient_id}.nii.gz"
-            })
-
-        # 生成dataset.json
-        dataset_json = OrderedDict({
-            "name": dataset_name,
-            "description": f"Automatic segmentation of RT structures ({datetime.now().strftime('%Y-%m')})",
-            "tensorImageSize": "3D",
-            "modality": all_modalities,
-            "labels": label_mapping,
-            "numTraining": len(training_list),
-            "training": training_list,
-            "file_ending": ".nii.gz"
-        })
-
-        with open(os.path.join(output_path, "dataset.json"), 'w') as f:
-            json.dump(dataset_json, f, indent=4)
-
-        print(f"Conversion complete. Dataset saved to: {output_path}")
-
     def create_dataset(self):
         # 获取选中的标签
         selected_labels = [cb.text() for cb in self.checkboxes if cb.isChecked()]
+
+        # 检查是否选择了至少一个标签
         if not selected_labels:
-            self.status_label.setText("请至少选择一个标签！")
-            self.status_label.setStyleSheet("color: #f44336;")
+            QMessageBox.warning(self, "警告", "请至少选择一个标签！")
             return
 
         # 获取数据集名称
@@ -657,8 +529,26 @@ class DropArea(QWidget):
         if not output_dir:
             return
 
+        # 检查现有数据集并生成新的数据集名称
+        existing_datasets = [d for d in os.listdir(output_dir) if d.startswith("Dataset")]
+        max_index = 0
+        for dataset in existing_datasets:
+            parts = dataset.split('_')
+            if len(parts) > 0 and parts[0][len("Dataset"):].isdigit():
+                index = int(parts[0][len("Dataset"):])
+                if index > max_index:
+                    max_index = index
+
+        new_dataset_name = f"Dataset{max_index + 1:03d}_{dataset_name}"
+
+        # 创建数据集文件夹
+        dataset_folder = os.path.join(output_dir, new_dataset_name)
+        os.makedirs(os.path.join(dataset_folder, "imagesTr"), exist_ok=True)
+        os.makedirs(os.path.join(dataset_folder, "labelsTr"), exist_ok=True)
+
         # 添加处理进度条
         dataset_progress = QProgressBar(self)
+        dataset_progress.setFixedHeight(20)  # 固定高度
         dataset_progress.setStyleSheet("""
             QProgressBar {
                 border: 1px solid #ccc;
@@ -690,72 +580,96 @@ class DropArea(QWidget):
             selected_labels_set = set(label.lower() for label in selected_labels)
             label_to_id = {label.lower(): idx + 1 for idx, label in enumerate(selected_labels)}
 
+            # 初始化数据结构
+            training_list = []
+
             # 遍历所有病人文件夹
             for patient_dir in patient_folders:
                 processed_count += 1
                 dataset_progress.setValue(processed_count)
-                self.status_label.setText(f"正在处理: {patient_dir} ({processed_count}/{total_folders})")
+                self.status_label.setText(f"正在处理: {patient_dir[:8]}... ({processed_count}/{total_folders})")
                 QApplication.processEvents()
 
                 patient_path = os.path.join(self.folder_path, patient_dir)
                 if not os.path.isdir(patient_path):
                     continue
 
-                # 查找RTStructure文件
-                for root, _, files in os.walk(patient_path):
-                    for file in files:
-                        if file.lower().startswith('rs') and file.endswith('.dcm'):
-                            file_path = os.path.join(root, file)
-                            try:
-                                # 读取DICOM文件
-                                ds = pydicom.dcmread(file_path)
+                # 初始化CT数据和RTStructure路径
+                ct_series = []
+                rtstruct_path = None
 
-                                # 获取当前病人的所有标签
-                                patient_labels = set()
-                                for roi in ds.StructureSetROISequence:
-                                    patient_labels.add(roi.ROIName.lower())
-
-                                # 检查是否包含所有选定的标签
-                                if selected_labels_set.issubset(patient_labels):
-                                    # 保留选定的标签，删除其他标签
-                                    new_structure_set = []
-                                    for roi in ds.StructureSetROISequence:
-                                        roi_name = roi.ROIName.lower()
-                                        if roi_name in selected_labels_set:
-                                            roi.ROINumber = label_to_id[roi_name]
-                                            new_structure_set.append(roi)
-
-                                    # 按照ROINumber排序
-                                    new_structure_set.sort(key=lambda x: x.ROINumber)
-                                    ds.StructureSetROISequence = new_structure_set
-
-                                    # 更新关联序列
-                                    for seq in getattr(ds, 'RTROIObservationsSequence', []):
-                                        if hasattr(seq, 'ReferencedROINumber'):
-                                            seq.ReferencedROINumber = label_to_id.get(seq.ROIName.lower(),
-                                                                                      seq.ReferencedROINumber)
-
-                                    if hasattr(ds, 'ROIContourSequence'):
-                                        for cs in ds.ROIContourSequence:
-                                            cs.ReferencedROINumber = label_to_id.get(cs.ROIName.lower(),
-                                                                                     cs.ReferencedROINumber)
-
-                                    ds.save_as(file_path)
-                                    valid_patients += 1
-                                else:
-                                    # 删除不符合要求的病人文件夹
-                                    import shutil
-                                    shutil.rmtree(patient_path)
-                                    deleted_patients += 1
-                                    print(f"删除不完整数据的用户: {patient_dir}")
+                # 遍历子目录以获取DICOM文件
+                for sub_dir in os.listdir(patient_path):
+                    sub_dir_path = os.path.join(patient_path, sub_dir)
+                    if os.path.isfile(sub_dir_path) and sub_dir_path.endswith('.dcm'):
+                        ct_series.append(sub_dir_path)
+                    elif os.path.isdir(sub_dir_path):
+                        for plans_file in os.listdir(sub_dir_path):
+                            if plans_file.lower().startswith('rs') and plans_file.endswith('.dcm'):
+                                rtstruct_path = os.path.join(sub_dir_path, plans_file)
                                 break
-                            except Exception as e:
-                                print(f"处理文件 {file_path} 时出错: {str(e)}")
-                            break
-                    break
 
-            # 调用convert_dicom_to_nnunet函数
-            self.convert_dicom_to_nnunet(self.folder_path, output_dir, dataset_id=1, dataset_name=dataset_name)
+                if not rtstruct_path:
+                    continue
+
+                # 读取RTStructure文件
+                try:
+                    ds = pydicom.dcmread(rtstruct_path)
+                    patient_labels = {roi.ROIName.lower() for roi in ds.StructureSetROISequence}
+
+                    # 检查是否包含所有选定的标签
+                    if not selected_labels_set.issubset(patient_labels):
+                        continue
+
+                    # 删除多余标签的轮廓信息
+                    new_structure_set = []
+                    for roi in ds.StructureSetROISequence:
+                        roi_name = roi.ROIName.lower()
+                        if roi_name in selected_labels_set:
+                            new_structure_set.append(roi)
+
+                    ds.StructureSetROISequence = new_structure_set
+
+                    # 保存RTStructure为NIfTI格式
+                    rtstruct_output_path = os.path.join(dataset_folder, "labelsTr", f"{patient_dir}.nii.gz")
+                    ds.save_as(rtstruct_output_path)
+
+                    # 转换CT图像为NIfTI格式
+                    ct_series.sort(key=lambda x: pydicom.dcmread(x).InstanceNumber)
+                    reader = sitk.ImageSeriesReader()
+                    reader.SetFileNames(ct_series)
+                    ct_volume = reader.Execute()
+
+                    # 保存CT图像
+                    ct_output_path = os.path.join(dataset_folder, "imagesTr", f"{patient_dir}_0000.nii.gz")
+                    sitk.WriteImage(ct_volume, ct_output_path)
+
+                    # 添加到训练列表
+                    training_list.append({
+                        "image": f"./imagesTr/{patient_dir}_0000.nii.gz",
+                        "label": f"./labelsTr/{patient_dir}.nii.gz"
+                    })
+
+                    valid_patients += 1
+
+                except Exception as e:
+                    print(f"处理文件 {rtstruct_path} 时出错: {str(e)}")
+                    deleted_patients += 1
+
+            # 生成dataset.json
+            dataset_json = {
+                "name": dataset_name,
+                "description": f"Automatic segmentation of RT structures ({datetime.now().strftime('%Y-%m')})",
+                "tensorImageSize": "3D",
+                "channel_names": {"0": "CT"},
+                "labels": {"background": 0, **{label: int(i) for i, label in enumerate(selected_labels)}},
+                "numTraining": len(training_list),
+                "training": training_list,
+                "file_ending": ".nii.gz"
+            }
+
+            with open(os.path.join(dataset_folder, "dataset.json"), 'w') as f:
+                json.dump(dataset_json, f, indent=4)
 
             # 显示完成消息
             QMessageBox.information(self, "数据集创建完成",
@@ -776,12 +690,13 @@ class DropArea(QWidget):
             # 移除进度条
             dataset_progress.deleteLater()
 
-    def on_process_finished(self, sorted_labels, deleted_dates, deleted_patients):
-        # 不再需要添加到label_list，直接更新复选框
+    def on_process_finished(self, sorted_labels, deleted_dates, deleted_patients, remaining_patients):
+        # 更新状态标签
         self.status_label.setText(
             f"处理完成:\n"
             f"- 删除了 {deleted_dates} 个重复日期文件夹\n"
-            f"- 删除了 {deleted_patients} 个缺少RTStructure的用户文件夹"
+            f"- 删除了 {deleted_patients} 个缺少RTStructure的用户文件夹\n"
+            f"- 当前阶段的病人数据数目: {remaining_patients}"
         )
         self.status_label.setStyleSheet("color: #4CAF50;")
         self.progress_bar.setVisible(False)

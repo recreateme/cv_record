@@ -1,6 +1,0 @@
-pyqt5
-pydicom
-simpleitk
-numpy
-pandas
-pyinstaller
