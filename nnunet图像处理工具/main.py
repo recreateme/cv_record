@@ -8,12 +8,14 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from datetime import datetime
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent
 import pydicom
+from skimage.draw import polygon
 import os
 import re
 import json
 from collections import OrderedDict
 import SimpleITK as sitk
 import numpy as np
+import subprocess
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -29,36 +31,14 @@ def process_subfolders(patient_path):
         print(f"获取子文件夹失败: {e}")
         return False
 
-    if len(subfolders) < 1:
-        print("无需处理,子文件夹数量≤1")
+    if len(subfolders) == 1:
+        print("无需处理,子文件夹数量为1")
         return False
-    date_pattern = re.compile(r'(\d{4})[-_]?(\d{2})[-_]?(\d{2})')
-    valid_date_folders = {}
 
-    for folder in subfolders:
-        match = date_pattern.search(folder)
-        if match:
-            try:
-                # 拼接为YYYYMMDD格式并解析
-                year, month, day = match.groups()
-                date_str = f"{year}{month}{day}"
-                folder_date = datetime.datetime.strptime(date_str, "%Y%m%d")
-                valid_date_folders[folder] = folder_date
-            except (ValueError, TypeError) as e:
-                print(f"日期解析失败 - 文件夹: {folder}, 错误: {e}")
-
-    # 文件夹排序
-    latest_folder = None
-    if valid_date_folders:
-        # 按日期降序排序
-        sorted_dates = sorted(valid_date_folders.items(), key=lambda x: x[1], reverse=True)
-        latest_folder = sorted_dates[0][0]
-        print(f"检测到标准日期格式,保留最新: {latest_folder}")
-    else:
-        # 无有效日期，按字符串字典序降序排序
-        subfolders.sort(reverse=True)
-        latest_folder = subfolders[0]
-        print(f"未检测到标准日期，按名称排序保留: {latest_folder}")
+    # 无有效日期，按字符串字典序降序排序
+    subfolders.sort(reverse=True)
+    latest_folder = subfolders[0]
+    print(f"未检测到标准日期，按名称排序保留: {latest_folder}")
 
     # 删除 && 保留
     deleted_count = 0
@@ -114,44 +94,34 @@ class ProcessThread(QThread):
                 latest_folder = None
                 latest_time = None
 
-                # 遍历用户目录下的所有文件和文件夹
                 for entry in os.listdir(patient_dir):
                     entry_path = os.path.join(patient_dir, entry)
                     if os.path.isdir(entry_path):
-                        # 检查文件夹的修改时间
                         entry_time = os.path.getmtime(entry_path)
                         if latest_time is None or entry_time > latest_time:
                             latest_time = entry_time
                             latest_folder = entry_path
 
-                # 删除多余的文件夹
                 for entry in os.listdir(patient_dir):
                     entry_path = os.path.join(patient_dir, entry)
                     if os.path.isdir(entry_path) and entry_path != latest_folder:
                         shutil.rmtree(entry_path)
                         deleted_dates += 1
-
-                # 检查最新文件夹中是否有RTStructure文件
                 if latest_folder:
                     for file in os.listdir(latest_folder):
                         if file.lower().startswith('rs') and file.endswith('.dcm'):
                             rtstruct_found = True
                             rtstruct_path = os.path.join(latest_folder, file)
-                            # 读取RTStructure文件
                             rtss = pydicom.dcmread(rtstruct_path)
                             for roi in rtss.StructureSetROISequence:
                                 all_labels.add(roi.ROIName.lower())
                             break
 
-                # 如果没有找到RTStructure文件，删除整个用户目录
                 if not rtstruct_found:
                     shutil.rmtree(patient_dir)
                     deleted_patients += 1
-
-                # 更新进度条
                 self.progress.emit(int((patient_idx + 1) / total_patients * 100))
 
-            # 计算处理后的病人数据数目
             remaining_patient_dirs = [d for d in os.listdir(self.root_dir) if
                                       os.path.isdir(os.path.join(self.root_dir, d))]
             remaining_patients = len(remaining_patient_dirs)
@@ -179,12 +149,10 @@ class DropArea(QWidget):
         super().__init__(parent)
         self.setAcceptDrops(True)
 
-        # 创建主布局
         main_layout = QHBoxLayout()
         left_layout = QVBoxLayout()
         right_layout = QVBoxLayout()
 
-        # 左侧控件
         self.path_label = QLabel("请选择或拖入文件夹")
         self.path_label.setAlignment(Qt.AlignCenter)
         self.path_label.setStyleSheet("""
@@ -196,13 +164,13 @@ class DropArea(QWidget):
             }
         """)
 
-        self.select_btn = QPushButton("选择文件夹")
-        self.process_btn = QPushButton("处理文件夹")
+        self.select_btn = QPushButton("选择原始文件")
+        self.process_btn = QPushButton("数据清洗")
         self.process_btn.setEnabled(False)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
-        self.progress_bar.setFixedHeight(20)  # 固定高度
+        self.progress_bar.setFixedHeight(20)
         self.progress_bar.setStyleSheet("""
             QProgressBar {
                 border: 1px solid #ccc;
@@ -216,18 +184,18 @@ class DropArea(QWidget):
 
         self.status_label = QLabel("")
 
-        # 右侧标签选择区域
+        # 右侧标签
         self.checkbox_container = QWidget()
         self.checkbox_layout = QVBoxLayout()
         self.checkbox_container.setLayout(self.checkbox_layout)
 
-        # 创建滚动区域
+        # 滚动区域
         scroll = QScrollArea()
         scroll.setWidget(self.checkbox_container)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
 
-        # 合并按钮
+        # 合并
         self.merge_btn = QPushButton("合并选中标签")
         self.merge_btn.setEnabled(False)
         self.merge_btn.clicked.connect(self.merge_labels)
@@ -237,7 +205,7 @@ class DropArea(QWidget):
         self.create_dataset_btn.setEnabled(False)
         self.create_dataset_btn.clicked.connect(self.create_dataset)
 
-        # 添加label_list用于显示处理结果
+        # 添加label_list
         self.label_list = QListWidget()
         self.label_list.setStyleSheet("""
             QListWidget {
@@ -245,6 +213,10 @@ class DropArea(QWidget):
                 border-radius: 3px;
             }
         """)
+
+        # 创建"创建训练目录"按钮
+        self.create_training_dir_btn = QPushButton("创建训练目录", self)
+        self.create_training_dir_btn.clicked.connect(self.create_training_directory)
 
         # 修改左侧布局，添加label_list
         left_layout.addWidget(self.path_label)
@@ -254,13 +226,13 @@ class DropArea(QWidget):
         left_layout.addWidget(self.status_label)
         left_layout.addWidget(QLabel("处理结果:"))
         left_layout.addWidget(self.label_list)  # 添加到左侧布局
+        left_layout.addWidget(self.create_training_dir_btn)
+        left_layout.addWidget(self.create_dataset_btn)
+        left_layout.addWidget(self.merge_btn)
         left_layout.addStretch()
 
         right_layout.addWidget(QLabel("选择要合并的标签:"))
         right_layout.addWidget(scroll)
-        right_layout.addWidget(self.merge_btn)
-        right_layout.addWidget(QLabel("选择要创建数据集的标签:"))
-        right_layout.addWidget(self.create_dataset_btn)
 
         # 设置左右布局的比例
         main_layout.addLayout(left_layout, 1)
@@ -268,13 +240,18 @@ class DropArea(QWidget):
 
         self.setLayout(main_layout)
 
-        # 连接信号
         self.select_btn.clicked.connect(self.select_folder)
         self.process_btn.clicked.connect(self.process_data)
 
         self.folder_path = None
         self.process_thread = None
-        self.checkboxes = []  # 存储复选框
+        # 存储复选框
+        self.checkboxes = []
+
+        # 实例变量记录文件夹路径
+        self.nnUNet_raw_path = None
+        self.nnUNet_preprocessed_path = None
+        self.nnUNet_results_path = None
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -301,7 +278,6 @@ class DropArea(QWidget):
         if not self.folder_path:
             return
 
-        # 清空列表和复选框
         self.label_list.clear()
         for checkbox in self.checkboxes:
             self.checkbox_layout.removeWidget(checkbox)
@@ -403,7 +379,6 @@ class DropArea(QWidget):
                 if not os.path.isdir(patient_path):
                     continue
 
-                # 查找RTStructure文件
                 rtstruct_path = None
                 for sub_dir in os.listdir(patient_path):
                     if rtstruct_path: break
@@ -420,7 +395,6 @@ class DropArea(QWidget):
                 if not rtstruct_path:
                     continue
 
-                # 读取RTStructure文件
                 try:
                     ds = pydicom.dcmread(rtstruct_path)
                     roi_numbers_to_merge = []
@@ -429,36 +403,31 @@ class DropArea(QWidget):
                             roi_numbers_to_merge.append(roi.ROINumber)
 
                     if not roi_numbers_to_merge:
-                        continue  # 跳过不包含选中标签的用户
+                        continue  # 跳过不合格用户
 
                     if len(roi_numbers_to_merge) == 1:
-                        # 仅有一个标签，直接修改RTStructure文件
                         for roi in ds.StructureSetROISequence:
                             if roi.ROINumber == roi_numbers_to_merge[0]:
                                 roi.ROIName = new_label
                                 modified_count += 1
                                 break
                     else:
-                        # 多个标签，合并轮廓信息
                         new_contour_sequence = []
                         for contour in ds.ROIContourSequence:
                             if contour.ReferencedROINumber in roi_numbers_to_merge:
                                 new_contour_sequence.extend(contour.ContourSequence)
 
-                        # 更新第一个ROI的名称
                         first_roi_number = roi_numbers_to_merge[0]
                         for roi in ds.StructureSetROISequence:
                             if roi.ROINumber == first_roi_number:
                                 roi.ROIName = new_label
                                 break
 
-                        # 删除其他ROI
                         ds.StructureSetROISequence = [
                             roi for roi in ds.StructureSetROISequence
                             if roi.ROINumber not in roi_numbers_to_merge[1:]
                         ]
 
-                        # 更新轮廓序列
                         ds.ROIContourSequence = [
                             contour for contour in ds.ROIContourSequence
                             if contour.ReferencedROINumber == first_roi_number
@@ -510,6 +479,40 @@ class DropArea(QWidget):
             # 移除进度条
             merge_progress.deleteLater()
 
+    def rtstruct_to_combined_mask(self, rtss, image, roi_names):
+        # 初始化掩码，与图像大小一致
+        image_array = sitk.GetArrayFromImage(image)  # z, y, x
+        combined_mask = np.zeros(image_array.shape, dtype=np.uint8)
+
+        # 为每个 ROI 分配整数标签
+        for roi_number, roi_name in roi_names.items():
+            label_value = list(roi_names.values()).index(roi_name) + 1  # 背景为 0，ROI 从 1 开始
+
+            # 找到对应的轮廓序列
+            contour_sequence = [cs for cs in rtss.ROIContourSequence if cs.ReferencedROINumber == roi_number]
+            if not contour_sequence:
+                continue
+
+            # 遍历每个轮廓
+            for contour in contour_sequence[0].ContourSequence:
+                points = np.array(contour.ContourData).reshape(-1, 3)
+                # 转换为图像坐标
+                indices = [image.TransformPhysicalPointToIndex(p) for p in points]
+                x_coords = [idx[0] for idx in indices]  # x 坐标
+                y_coords = [idx[1] for idx in indices]  # y 坐标
+                z_slice = indices[0][2]  # z 坐标（假设同一轮廓在同一切片）
+
+                # 检查边界
+                if not all(
+                        0 <= i < s for i, s in zip([min(x_coords), min(y_coords), z_slice], combined_mask.shape[::-1])):
+                    continue
+
+                # 填充多边形区域
+                rr, cc = polygon(y_coords, x_coords, shape=combined_mask[z_slice].shape)
+                combined_mask[z_slice, rr, cc] = label_value
+
+        return combined_mask
+
     def create_dataset(self):
         # 获取选中的标签
         selected_labels = [cb.text() for cb in self.checkboxes if cb.isChecked()]
@@ -525,7 +528,10 @@ class DropArea(QWidget):
             return
 
         # 选择输出目录
-        output_dir = QFileDialog.getExistingDirectory(self, "选择输出目录")
+        if self.nnUNet_raw_path is not None:
+            output_dir = self.nnUNet_raw_path
+        else:
+            output_dir = QFileDialog.getExistingDirectory(self, "选择输出目录")
         if not output_dir:
             return
 
@@ -539,12 +545,15 @@ class DropArea(QWidget):
                 if index > max_index:
                     max_index = index
 
+        self.dataset_index = max_index
         new_dataset_name = f"Dataset{max_index + 1:03d}_{dataset_name}"
 
         # 创建数据集文件夹
         dataset_folder = os.path.join(output_dir, new_dataset_name)
-        os.makedirs(os.path.join(dataset_folder, "imagesTr"), exist_ok=True)
-        os.makedirs(os.path.join(dataset_folder, "labelsTr"), exist_ok=True)
+        image_folder = os.path.join(dataset_folder, "imagesTr")
+        label_folder = os.path.join(dataset_folder, "labelsTr")
+        os.makedirs(image_folder, exist_ok=True)
+        os.makedirs(label_folder, exist_ok=True)
 
         # 添加处理进度条
         dataset_progress = QProgressBar(self)
@@ -568,8 +577,8 @@ class DropArea(QWidget):
             self.status_label.setStyleSheet("color: #000;")
 
             # 获取所有病人文件夹
-            patient_folders = [d for d in os.listdir(self.folder_path)
-                               if os.path.isdir(os.path.join(self.folder_path, d))]
+            patient_folders = [d for d in os.listdir(self.folder_path) if
+                               os.path.isdir(os.path.join(self.folder_path, d))]
             total_folders = len(patient_folders)
             dataset_progress.setMaximum(total_folders)
 
@@ -584,7 +593,7 @@ class DropArea(QWidget):
             training_list = []
 
             # 遍历所有病人文件夹
-            for patient_dir in patient_folders:
+            for patient_index, patient_dir in enumerate(patient_folders, start=1):
                 processed_count += 1
                 dataset_progress.setValue(processed_count)
                 self.status_label.setText(f"正在处理: {patient_dir[:8]}... ({processed_count}/{total_folders})")
@@ -610,51 +619,119 @@ class DropArea(QWidget):
                                 break
 
                 if not rtstruct_path:
+                    print(f"未找到RTStructure文件，跳过病人: {patient_dir}")
                     continue
 
-                # 读取RTStructure文件
-                try:
-                    ds = pydicom.dcmread(rtstruct_path)
-                    patient_labels = {roi.ROIName.lower() for roi in ds.StructureSetROISequence}
+                ds = pydicom.dcmread(rtstruct_path)
+                patient_labels = {roi.ROIName.lower() for roi in ds.StructureSetROISequence}
+                # 检查是否包含所有选定的标签
+                if not selected_labels_set.issubset(patient_labels):
+                    print(f"病人 {patient_dir} 的RTStructure不包含所有选定标签，跳过该病人。")
+                    continue
+                else:
+                    dicom_dir = os.path.join(patient_path, "dicom")
+                    if not os.path.exists(dicom_dir):
+                        os.makedirs(dicom_dir)
+                    for ct in ct_series:
+                        shutil.move(ct, dicom_dir)
 
-                    # 检查是否包含所有选定的标签
-                    if not selected_labels_set.issubset(patient_labels):
-                        continue
+                # 删除StructureSet中ROISequence中多余的ROI并根据label_to_id映射重新编号
+                valid_roi_map = {
+                    roi.ROIName.lower(): label_to_id[roi.ROIName.lower()]
+                    for roi in ds.StructureSetROISequence
+                    if roi.ROIName.lower() in selected_labels_set
+                }
 
-                    # 删除多余标签的轮廓信息
-                    new_structure_set = []
-                    for roi in ds.StructureSetROISequence:
-                        roi_name = roi.ROIName.lower()
-                        if roi_name in selected_labels_set:
-                            new_structure_set.append(roi)
+                # 过滤并更新StructureSetROISequence
+                new_roi_sequence = []
+                for roi in ds.StructureSetROISequence:
+                    roi_name = roi.ROIName.lower()
+                    if roi_name in valid_roi_map:
+                        roi.ROINumber = valid_roi_map[roi_name]  # 直接修改属性
+                        new_roi_sequence.append(roi)
+                ds.StructureSetROISequence = new_roi_sequence
 
-                    ds.StructureSetROISequence = new_structure_set
+                # 过滤关联序列（使用集合查找优化性能）
+                valid_numbers = set(valid_roi_map.values())
+                ds.ROIContourSequence = [c for c in ds.ROIContourSequence if c.ReferencedROINumber in valid_numbers]
+                ds.RTROIObservationsSequence = [o for o in ds.RTROIObservationsSequence if
+                                                o.ReferencedROINumber in valid_numbers]
+                ds.NumberOfROIContours = len(ds.ROIContourSequence)
 
-                    # 保存RTStructure为NIfTI格式
-                    rtstruct_output_path = os.path.join(dataset_folder, "labelsTr", f"{patient_dir}.nii.gz")
-                    ds.save_as(rtstruct_output_path)
+                # 保存修改（保持原始传输语法）
+                ds.save_as(rtstruct_path)
 
-                    # 转换CT图像为NIfTI格式
-                    ct_series.sort(key=lambda x: pydicom.dcmread(x).InstanceNumber)
-                    reader = sitk.ImageSeriesReader()
-                    reader.SetFileNames(ct_series)
-                    ct_volume = reader.Execute()
+                # 读取DICOM序列并获取空间属性
+                reader = sitk.ImageSeriesReader()
+                dicom_files = reader.GetGDCMSeriesFileNames(dicom_dir)
+                reader.SetFileNames(dicom_files)
+                ct_volume = reader.Execute()
+                # 保存CT图像
 
-                    # 保存CT图像
-                    ct_output_path = os.path.join(dataset_folder, "imagesTr", f"{patient_dir}_0000.nii.gz")
-                    sitk.WriteImage(ct_volume, ct_output_path)
+                ct_output_path = os.path.join(dataset_folder, "imagesTr", f"{valid_patients:03d}_0000.nii.gz")
+                sitk.WriteImage(ct_volume, ct_output_path)
 
-                    # 添加到训练列表
-                    training_list.append({
-                        "image": f"./imagesTr/{patient_dir}_0000.nii.gz",
-                        "label": f"./labelsTr/{patient_dir}.nii.gz"
-                    })
+                # 1. 读取CT图像并获取空间属性
+                ct_image = sitk.ReadImage(ct_output_path)
+                spacing = ct_image.GetSpacing()  # 体素间距 (x,y,z)
+                origin = ct_image.GetOrigin()  # 原点坐标
+                direction = ct_image.GetDirection()  # 方向矩阵
+                size = ct_image.GetSize()  # 图像维度 (w,h,d)
 
-                    valid_patients += 1
+                # 2. 创建空白标签图像并转换为numpy数组
+                mask = sitk.Image(size, sitk.sitkUInt8)
+                mask.SetSpacing(spacing)
+                mask.SetOrigin(origin)
+                mask.SetDirection(direction)
+                mask_array = sitk.GetArrayFromImage(mask)  # 初始化mask_array
 
-                except Exception as e:
-                    print(f"处理文件 {rtstruct_path} 时出错: {str(e)}")
-                    deleted_patients += 1
+                # 3. 读取RTSTRUCT文件
+                rt_ds = pydicom.dcmread(rtstruct_path)
+                roi_contour_sequence = rt_ds.ROIContourSequence
+
+                # 4. 遍历所有ROI并绘制掩码
+                for roi in roi_contour_sequence:
+                    contour_sequence = roi.ContourSequence
+                    for contour in contour_sequence:
+                        try:
+                            # 获取物理坐标点
+                            points = np.array(contour.ContourData).reshape(-1, 3)
+
+                            # 转换为体素坐标
+                            voxel_coords = [
+                                ct_image.TransformPhysicalPointToIndex(point.tolist())
+                                for point in points
+                            ]
+
+                            # 提取切片索引并限制范围
+                            z_index = int(np.clip(voxel_coords[0][2], 0, mask_array.shape[0] - 1))
+
+                            # 生成二维多边形掩码
+                            x_coords = [v[0] for v in voxel_coords]
+                            y_coords = [v[1] for v in voxel_coords]
+                            rr, cc = polygon(y_coords, x_coords)
+
+                            # 更新mask_array
+                            mask_array[z_index, rr, cc] = 1
+
+                        except Exception as e:
+                            print(f"绘制ROI失败: {str(e)}")
+                            continue
+
+                # 5. 将numpy数组转回SimpleITK图像
+                mask = sitk.GetImageFromArray(mask_array)
+                mask.CopyInformation(ct_image)  # 继承空间属性
+
+                # 6. 保存掩码文件
+                label_output_path = os.path.join(label_folder, f"{valid_patients:03d}.nii.gz")
+                sitk.WriteImage(mask, label_output_path)
+
+                # 更新训练列表
+                training_list.append({
+                    "image": f"./imagesTr/{valid_patients}_0000.nii.gz",
+                    "label": f"./labelsTr/{valid_patients}.nii.gz"
+                })
+                valid_patients += 1
 
             # 生成dataset.json
             dataset_json = {
@@ -662,7 +739,7 @@ class DropArea(QWidget):
                 "description": f"Automatic segmentation of RT structures ({datetime.now().strftime('%Y-%m')})",
                 "tensorImageSize": "3D",
                 "channel_names": {"0": "CT"},
-                "labels": {"background": 0, **{label: int(i) for i, label in enumerate(selected_labels)}},
+                "labels": {"background": 0, **{label: int(i)+1 for i, label in enumerate(selected_labels)}},
                 "numTraining": len(training_list),
                 "training": training_list,
                 "file_ending": ".nii.gz"
@@ -710,6 +787,21 @@ class DropArea(QWidget):
         self.status_label.setStyleSheet("color: #f44336;")
         self.progress_bar.setVisible(False)
         self.process_btn.setEnabled(True)
+
+    def create_training_directory(self):
+        # 选择目录
+        training_dir = QFileDialog.getExistingDirectory(self, "选择训练目录")
+        if training_dir:
+            # 创建子目录
+            self.nnUNet_raw_path = os.path.join(training_dir, "nnUNet_raw")
+            self.nnUNet_preprocessed_path = os.path.join(training_dir, "nnUNet_preprocessed")
+            self.nnUNet_results_path = os.path.join(training_dir, "nnUNet_results")
+
+            os.makedirs(self.nnUNet_raw_path, exist_ok=True)
+            os.makedirs(self.nnUNet_preprocessed_path, exist_ok=True)
+            os.makedirs(self.nnUNet_results_path, exist_ok=True)
+
+            QMessageBox.information(self, "成功", "训练目录已创建！")
 
 
 class MainWindow(QMainWindow):
